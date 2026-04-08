@@ -1,0 +1,204 @@
+name: Load LoRA Adapter from Azure ML Registry
+
+# Reusable workflow — called by agent-repository workflows to retrieve a
+# registered LoRA adapter (MLflow artifact) from the Azure AI Foundry /
+# Azure ML Model Registry and make it available as a workflow artifact or
+# publish its URI for downstream steps.
+#
+# Usage from an agent repo:
+#
+#   jobs:
+#     load:
+#       uses: ASISaga/aos-intelligence/.github/workflows/load-lora-adapter.yml@main
+#       with:
+#         persona_type: ceo
+#         adapter_version: latest
+#         azure_ml_workspace: my-aml-workspace
+#         azure_resource_group: my-resource-group
+#       secrets:
+#         AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+#         AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+#         AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+on:
+  workflow_call:
+    inputs:
+      persona_type:
+        description: "Persona type to load (e.g. 'ceo', 'cmo'). Resolves model name lora-adapter-<persona_type>."
+        required: true
+        type: string
+      adapter_version:
+        description: "Version to load. Use 'latest' to resolve the most recent version."
+        required: false
+        type: string
+        default: "latest"
+      download_path:
+        description: "Local path to download adapter artifacts to. Defaults to 'adapter'."
+        required: false
+        type: string
+        default: "adapter"
+      upload_artifact:
+        description: "When 'true', upload the downloaded adapter as a GitHub Actions artifact."
+        required: false
+        type: string
+        default: "false"
+      artifact_name:
+        description: "GitHub Actions artifact name (used when upload_artifact='true')."
+        required: false
+        type: string
+        default: "lora-adapter"
+      azure_ml_workspace:
+        description: "Azure ML workspace name."
+        required: true
+        type: string
+      azure_resource_group:
+        description: "Azure resource group containing the workspace."
+        required: true
+        type: string
+      registry_name:
+        description: "Azure ML Registry name. Leave empty to use the workspace model registry."
+        required: false
+        type: string
+        default: ""
+      python_version:
+        description: "Python version used for the download step."
+        required: false
+        type: string
+        default: "3.11"
+    secrets:
+      AZURE_CLIENT_ID:
+        description: "Client ID of the Azure service principal / managed identity (OIDC)."
+        required: true
+      AZURE_TENANT_ID:
+        description: "Azure tenant ID."
+        required: true
+      AZURE_SUBSCRIPTION_ID:
+        description: "Azure subscription ID."
+        required: true
+    outputs:
+      model_name:
+        description: "Model name in the Azure ML registry."
+        value: ${{ jobs.load-adapter.outputs.model_name }}
+      model_version:
+        description: "Resolved model version that was downloaded."
+        value: ${{ jobs.load-adapter.outputs.model_version }}
+      model_asset_id:
+        description: "Fully qualified Azure ML Model Asset ID."
+        value: ${{ jobs.load-adapter.outputs.model_asset_id }}
+      adapter_uri:
+        description: "Azure ML URI (azureml://) of the adapter artifacts."
+        value: ${{ jobs.load-adapter.outputs.adapter_uri }}
+      download_path:
+        description: "Local path where artifacts were downloaded (empty when upload_artifact='false')."
+        value: ${{ jobs.load-adapter.outputs.download_path }}
+
+jobs:
+  load-adapter:
+    name: Load LoRA adapter — ${{ inputs.persona_type }} v${{ inputs.adapter_version }}
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # required for OIDC
+      contents: read
+    outputs:
+      model_name: ${{ steps.resolve.outputs.model_name }}
+      model_version: ${{ steps.resolve.outputs.model_version }}
+      model_asset_id: ${{ steps.resolve.outputs.model_asset_id }}
+      adapter_uri: ${{ steps.resolve.outputs.adapter_uri }}
+      download_path: ${{ steps.resolve.outputs.download_path }}
+
+    steps:
+      - name: Set up Python ${{ inputs.python_version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+          cache: pip
+
+      - name: Install Azure ML SDK
+        run: pip install "azure-ai-ml>=1.26.0" "azure-identity>=1.19.0"
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Resolve and download LoRA adapter
+        id: resolve
+        env:
+          PERSONA_TYPE: ${{ inputs.persona_type }}
+          ADAPTER_VERSION: ${{ inputs.adapter_version }}
+          DOWNLOAD_PATH: ${{ inputs.download_path }}
+          UPLOAD_ARTIFACT: ${{ inputs.upload_artifact }}
+          AZURE_ML_WORKSPACE: ${{ inputs.azure_ml_workspace }}
+          AZURE_RESOURCE_GROUP: ${{ inputs.azure_resource_group }}
+          REGISTRY_NAME: ${{ inputs.registry_name }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        run: |
+          python - <<'PYTHON'
+          import os
+
+          from azure.ai.ml import MLClient
+          from azure.identity import DefaultAzureCredential
+
+          credential = DefaultAzureCredential()
+
+          registry_name = os.environ.get("REGISTRY_NAME", "").strip()
+
+          if registry_name:
+              ml_client = MLClient(
+                  credential=credential,
+                  registry_name=registry_name,
+              )
+          else:
+              ml_client = MLClient(
+                  credential=credential,
+                  subscription_id=os.environ["AZURE_SUBSCRIPTION_ID"],
+                  resource_group_name=os.environ["AZURE_RESOURCE_GROUP"],
+                  workspace_name=os.environ["AZURE_ML_WORKSPACE"],
+              )
+
+          persona_type = os.environ["PERSONA_TYPE"]
+          model_name = f"lora-adapter-{persona_type}"
+          requested_version = os.environ.get("ADAPTER_VERSION", "latest").strip()
+
+          # Resolve the version
+          if requested_version.lower() == "latest":
+              versions = list(ml_client.models.list(name=model_name))
+              if not versions:
+                  raise ValueError(f"No versions found for model '{model_name}' in registry")
+              model_obj = max(versions, key=lambda m: int(m.version) if m.version.isdigit() else 0)
+          else:
+              model_obj = ml_client.models.get(name=model_name, version=requested_version)
+
+          print(f"Resolved: {model_obj.name}:{model_obj.version}")
+          print(f"  URI: {model_obj.path}")
+          print(f"  Asset ID: {model_obj.id}")
+
+          # Download artifacts only when upload_artifact is requested
+          download_path = ""
+          if os.environ.get("UPLOAD_ARTIFACT", "false").lower() == "true":
+              download_path = os.environ.get("DOWNLOAD_PATH", "adapter")
+              ml_client.models.download(
+                  name=model_name,
+                  version=model_obj.version,
+                  download_path=download_path,
+              )
+              print(f"  Downloaded to: {download_path}")
+
+          output_file = os.environ["GITHUB_OUTPUT"]
+          with open(output_file, "a") as fh:
+              fh.write(f"model_name={model_obj.name}\n")
+              fh.write(f"model_version={model_obj.version}\n")
+              fh.write(f"model_asset_id={model_obj.id or ''}\n")
+              fh.write(f"adapter_uri={model_obj.path or ''}\n")
+              fh.write(f"download_path={download_path}\n")
+          PYTHON
+
+      - name: Upload adapter artifacts as GitHub artifact
+        if: inputs.upload_artifact == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: ${{ inputs.download_path }}
+          if-no-files-found: error
