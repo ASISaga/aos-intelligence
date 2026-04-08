@@ -1,0 +1,225 @@
+name: Persist LoRA Adapter to Azure ML Registry
+
+# Reusable workflow — called by agent-repository workflows to register a
+# trained LoRA adapter (MLflow artifact) in the Azure AI Foundry / Azure ML
+# Model Registry so it can later be retrieved and served by LoRAx.
+#
+# The workflow supports two adapter sources:
+#   - "aml_job"  : the adapter is already an output of an Azure ML training job.
+#                  Provide `aml_job_name`; the run's model output is registered
+#                  directly without downloading artifacts to the runner.
+#   - "local"    : the adapter artifacts have been checked out / downloaded to
+#                  `adapter_path` on the runner (e.g. produced by a prior step).
+#
+# Usage from an agent repo:
+#
+#   jobs:
+#     persist:
+#       uses: ASISaga/aos-intelligence/.github/workflows/persist-lora-adapter.yml@main
+#       with:
+#         agent_name: ceo-agent
+#         persona_type: ceo
+#         adapter_source: aml_job
+#         aml_job_name: eager_apple_xyz123
+#         azure_ml_workspace: my-aml-workspace
+#         azure_resource_group: my-resource-group
+#       secrets:
+#         AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+#         AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+#         AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+on:
+  workflow_call:
+    inputs:
+      agent_name:
+        description: "Agent name (e.g. ceo-agent). Used as a tag on the model asset."
+        required: true
+        type: string
+      persona_type:
+        description: "Persona type (e.g. 'ceo', 'cmo'). Used as the registry model name prefix."
+        required: true
+        type: string
+      adapter_version:
+        description: "Version string for the Model Asset (e.g. '1', '2')."
+        required: false
+        type: string
+        default: "1"
+      base_model_version:
+        description: "Exact base model tag the adapter targets (e.g. 'Meta-Llama-3.3-70B-Instruct')."
+        required: false
+        type: string
+        default: "Meta-Llama-3.3-70B-Instruct"
+      adapter_source:
+        description: "Source of the adapter artifacts: 'aml_job' or 'local'."
+        required: false
+        type: string
+        default: "aml_job"
+      aml_job_name:
+        description: "Azure ML job name whose 'model' output to register (used when adapter_source='aml_job')."
+        required: false
+        type: string
+        default: ""
+      adapter_path:
+        description: "Local path to the adapter directory (used when adapter_source='local')."
+        required: false
+        type: string
+        default: "adapter"
+      description:
+        description: "Human-readable description for the registered model."
+        required: false
+        type: string
+        default: ""
+      azure_ml_workspace:
+        description: "Azure ML workspace name."
+        required: true
+        type: string
+      azure_resource_group:
+        description: "Azure resource group containing the workspace."
+        required: true
+        type: string
+      registry_name:
+        description: "Azure ML Registry name. Leave empty to register in the workspace model registry."
+        required: false
+        type: string
+        default: ""
+      python_version:
+        description: "Python version used for the registration step."
+        required: false
+        type: string
+        default: "3.11"
+    secrets:
+      AZURE_CLIENT_ID:
+        description: "Client ID of the Azure service principal / managed identity (OIDC)."
+        required: true
+      AZURE_TENANT_ID:
+        description: "Azure tenant ID."
+        required: true
+      AZURE_SUBSCRIPTION_ID:
+        description: "Azure subscription ID."
+        required: true
+    outputs:
+      model_asset_id:
+        description: "Fully qualified Azure ML Model Asset ID of the registered adapter."
+        value: ${{ jobs.persist-adapter.outputs.model_asset_id }}
+      model_name:
+        description: "Model name in the Azure ML registry (lora-adapter-<persona_type>)."
+        value: ${{ jobs.persist-adapter.outputs.model_name }}
+      model_version:
+        description: "Registered model version."
+        value: ${{ jobs.persist-adapter.outputs.model_version }}
+
+jobs:
+  persist-adapter:
+    name: Persist LoRA adapter — ${{ inputs.persona_type }} v${{ inputs.adapter_version }}
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # required for OIDC
+      contents: read
+    outputs:
+      model_asset_id: ${{ steps.register.outputs.model_asset_id }}
+      model_name: ${{ steps.register.outputs.model_name }}
+      model_version: ${{ steps.register.outputs.model_version }}
+
+    steps:
+      - name: Checkout calling repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ inputs.python_version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+          cache: pip
+
+      - name: Install Azure ML SDK and MLflow
+        run: pip install "azure-ai-ml>=1.26.0" "azure-identity>=1.19.0" "mlflow>=3.5.0"
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Register LoRA adapter in Azure ML Model Registry
+        id: register
+        env:
+          AGENT_NAME: ${{ inputs.agent_name }}
+          PERSONA_TYPE: ${{ inputs.persona_type }}
+          ADAPTER_VERSION: ${{ inputs.adapter_version }}
+          BASE_MODEL_VERSION: ${{ inputs.base_model_version }}
+          ADAPTER_SOURCE: ${{ inputs.adapter_source }}
+          AML_JOB_NAME: ${{ inputs.aml_job_name }}
+          ADAPTER_PATH: ${{ inputs.adapter_path }}
+          DESCRIPTION: ${{ inputs.description }}
+          AZURE_ML_WORKSPACE: ${{ inputs.azure_ml_workspace }}
+          AZURE_RESOURCE_GROUP: ${{ inputs.azure_resource_group }}
+          REGISTRY_NAME: ${{ inputs.registry_name }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        run: |
+          python - <<'PYTHON'
+          import os
+
+          from azure.ai.ml import MLClient
+          from azure.ai.ml.entities import Model
+          from azure.identity import DefaultAzureCredential
+
+          credential = DefaultAzureCredential()
+
+          registry_name = os.environ.get("REGISTRY_NAME", "").strip()
+
+          if registry_name:
+              ml_client = MLClient(
+                  credential=credential,
+                  registry_name=registry_name,
+              )
+          else:
+              ml_client = MLClient(
+                  credential=credential,
+                  subscription_id=os.environ["AZURE_SUBSCRIPTION_ID"],
+                  resource_group_name=os.environ["AZURE_RESOURCE_GROUP"],
+                  workspace_name=os.environ["AZURE_ML_WORKSPACE"],
+              )
+
+          persona_type = os.environ["PERSONA_TYPE"]
+          model_name = f"lora-adapter-{persona_type}"
+          adapter_source = os.environ["ADAPTER_SOURCE"].lower()
+
+          if adapter_source == "aml_job":
+              job_name = os.environ.get("AML_JOB_NAME", "").strip()
+              if not job_name:
+                  raise ValueError("aml_job_name is required when adapter_source='aml_job'")
+              # Reference the job output directly — no local download needed
+              adapter_path = f"azureml://jobs/{job_name}/outputs/model"
+          else:
+              adapter_path = os.environ.get("ADAPTER_PATH", "adapter")
+
+          description = os.environ.get("DESCRIPTION", "").strip() or (
+              f"LoRA adapter for {persona_type} persona "
+              f"(base: {os.environ['BASE_MODEL_VERSION']})"
+          )
+
+          model = Model(
+              name=model_name,
+              version=os.environ["ADAPTER_VERSION"],
+              path=adapter_path,
+              description=description,
+              flavors={"python_function": {"loader_module": "mlflow.pyfunc"}},
+              tags={
+                  "persona_type": persona_type,
+                  "base_model_version": os.environ["BASE_MODEL_VERSION"],
+                  "agent_name": os.environ["AGENT_NAME"],
+                  "source_repo": os.environ.get("GITHUB_REPOSITORY", ""),
+                  "source_sha": os.environ.get("GITHUB_SHA", ""),
+              },
+          )
+
+          registered = ml_client.models.create_or_update(model)
+          print(f"Model registered: {registered.name}:{registered.version}")
+          print(f"  Asset ID: {registered.id}")
+
+          output_file = os.environ["GITHUB_OUTPUT"]
+          with open(output_file, "a") as fh:
+              fh.write(f"model_asset_id={registered.id or ''}\n")
+              fh.write(f"model_name={registered.name}\n")
+              fh.write(f"model_version={registered.version}\n")
+          PYTHON

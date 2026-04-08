@@ -1,0 +1,163 @@
+name: Load Dataset to Azure ML
+
+# Reusable workflow — called by agent-repository workflows to upload
+# JSONL or MLTable fine-tuning datasets to Azure ML as versioned Data Assets.
+#
+# Usage from an agent repo:
+#
+#   jobs:
+#     upload:
+#       uses: ASISaga/aos-intelligence/.github/workflows/load-dataset.yml@main
+#       with:
+#         agent_name: ceo-agent
+#         dataset_path: data/finetune/ceo_preferences.jsonl
+#         dataset_name: ceo-finetune-dataset
+#         azure_ml_workspace: my-aml-workspace
+#         azure_resource_group: my-resource-group
+#       secrets:
+#         AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+#         AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+#         AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+on:
+  workflow_call:
+    inputs:
+      agent_name:
+        description: "Agent/persona name (e.g. ceo-agent). Used as a tag on the data asset."
+        required: true
+        type: string
+      dataset_type:
+        description: "Dataset format: 'jsonl' (URI_FILE) or 'mltable' (MLTABLE)."
+        required: false
+        type: string
+        default: "jsonl"
+      dataset_path:
+        description: "Path to the dataset file or MLTable directory relative to the calling repo root."
+        required: true
+        type: string
+      dataset_name:
+        description: "Name for the Azure ML Data Asset."
+        required: true
+        type: string
+      dataset_version:
+        description: "Version string for the Data Asset (e.g. '1', '2')."
+        required: false
+        type: string
+        default: "1"
+      azure_ml_workspace:
+        description: "Azure ML workspace name."
+        required: true
+        type: string
+      azure_resource_group:
+        description: "Azure resource group containing the workspace."
+        required: true
+        type: string
+      python_version:
+        description: "Python version used for the upload step."
+        required: false
+        type: string
+        default: "3.11"
+    secrets:
+      AZURE_CLIENT_ID:
+        description: "Client ID of the Azure service principal / managed identity (OIDC)."
+        required: true
+      AZURE_TENANT_ID:
+        description: "Azure tenant ID."
+        required: true
+      AZURE_SUBSCRIPTION_ID:
+        description: "Azure subscription ID."
+        required: true
+    outputs:
+      dataset_uri:
+        description: "Azure ML Data Asset URI (azureml:// path) of the registered dataset."
+        value: ${{ jobs.upload-dataset.outputs.dataset_uri }}
+      dataset_asset_id:
+        description: "Fully qualified Azure ML Data Asset ID."
+        value: ${{ jobs.upload-dataset.outputs.dataset_asset_id }}
+
+jobs:
+  upload-dataset:
+    name: Upload dataset — ${{ inputs.dataset_name }}:${{ inputs.dataset_version }}
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # required for OIDC
+      contents: read
+    outputs:
+      dataset_uri: ${{ steps.upload.outputs.dataset_uri }}
+      dataset_asset_id: ${{ steps.upload.outputs.dataset_asset_id }}
+
+    steps:
+      - name: Checkout calling repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ inputs.python_version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+          cache: pip
+
+      - name: Install Azure ML SDK
+        run: pip install "azure-ai-ml>=1.26.0" "azure-identity>=1.19.0"
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Upload dataset to Azure ML
+        id: upload
+        env:
+          AGENT_NAME: ${{ inputs.agent_name }}
+          DATASET_TYPE: ${{ inputs.dataset_type }}
+          DATASET_PATH: ${{ inputs.dataset_path }}
+          DATASET_NAME: ${{ inputs.dataset_name }}
+          DATASET_VERSION: ${{ inputs.dataset_version }}
+          AZURE_ML_WORKSPACE: ${{ inputs.azure_ml_workspace }}
+          AZURE_RESOURCE_GROUP: ${{ inputs.azure_resource_group }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        run: |
+          python - <<'PYTHON'
+          import os
+
+          from azure.ai.ml import MLClient
+          from azure.ai.ml.constants import AssetTypes
+          from azure.ai.ml.entities import Data
+          from azure.identity import DefaultAzureCredential
+
+          credential = DefaultAzureCredential()
+          ml_client = MLClient(
+              credential=credential,
+              subscription_id=os.environ["AZURE_SUBSCRIPTION_ID"],
+              resource_group_name=os.environ["AZURE_RESOURCE_GROUP"],
+              workspace_name=os.environ["AZURE_ML_WORKSPACE"],
+          )
+
+          dataset_type = os.environ["DATASET_TYPE"].lower()
+          asset_type = AssetTypes.URI_FILE if dataset_type == "jsonl" else AssetTypes.MLTABLE
+
+          data_asset = Data(
+              name=os.environ["DATASET_NAME"],
+              version=os.environ["DATASET_VERSION"],
+              description=f"Fine-tuning dataset for {os.environ['AGENT_NAME']}",
+              path=os.environ["DATASET_PATH"],
+              type=asset_type,
+              tags={
+                  "agent_name": os.environ["AGENT_NAME"],
+                  "dataset_type": dataset_type,
+                  "source_repo": os.environ.get("GITHUB_REPOSITORY", ""),
+                  "source_sha": os.environ.get("GITHUB_SHA", ""),
+              },
+          )
+
+          registered = ml_client.data.create_or_update(data_asset)
+          print(f"Dataset registered: {registered.name}:{registered.version}")
+          print(f"  URI: {registered.path}")
+          print(f"  Asset ID: {registered.id}")
+
+          output_file = os.environ["GITHUB_OUTPUT"]
+          with open(output_file, "a") as fh:
+              fh.write(f"dataset_uri={registered.path}\n")
+              fh.write(f"dataset_asset_id={registered.id or ''}\n")
+          PYTHON
